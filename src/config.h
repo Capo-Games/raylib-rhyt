@@ -92,7 +92,7 @@
 #if !SUPPORT_PARTIALBUSY_WAIT_LOOP && !SUPPORT_BUSY_WAIT_LOOP
     // Use a partial-busy wait loop, in this case frame sleeps for most of the time,
     // but then runs a busy loop at the end for accuracy
-    #define SUPPORT_PARTIALBUSY_WAIT_LOOP   1
+    #define SUPPORT_PARTIALBUSY_WAIT_LOOP   0
 #endif
 #ifndef SUPPORT_SCREEN_CAPTURE
     // Allow automatic screen capture of current screen pressing F12, defined in KeyCallback()
