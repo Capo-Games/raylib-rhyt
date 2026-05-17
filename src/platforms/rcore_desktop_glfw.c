@@ -1749,6 +1749,29 @@ int InitPlatform(void)
         }
         else CORE.Window.render = CORE.Window.screen;
 
+#if defined(__APPLE__)
+        if (FLAG_IS_SET(CORE.Window.flags, FLAG_FULLSCREEN_MODE))
+        {
+            int winWidth = 0;
+            int winHeight = 0;
+            int fbWidth = 0;
+            int fbHeight = 0;
+
+            glfwGetWindowSize(platform.handle, &winWidth, &winHeight);
+            glfwGetFramebufferSize(platform.handle, &fbWidth, &fbHeight);
+
+            if ((winWidth > 0) && (winHeight > 0) && (fbWidth > 0) && (fbHeight > 0))
+            {
+                CORE.Window.screen.width = winWidth;
+                CORE.Window.screen.height = winHeight;
+                CORE.Window.render.width = fbWidth;
+                CORE.Window.render.height = fbHeight;
+                CORE.Window.screenScale = MatrixScale((float)fbWidth/winWidth, (float)fbHeight/winHeight, 1.0f);
+                SetMouseScale(1.0f, 1.0f);
+            }
+        }
+#endif
+
         // Current active framebuffer size is main framebuffer size
         CORE.Window.currentFbo = CORE.Window.render;
 
@@ -1929,15 +1952,19 @@ static void FramebufferSizeCallback(GLFWwindow *window, int width, int height)
         CORE.Window.screenScale = MatrixScale(1.0f, 1.0f, 1.0f);
         SetMouseScale(1.0f, 1.0f);
 
-        // On Wayland with GLFW_SCALE_FRAMEBUFFER, the framebuffer is still scaled in fullscreen, use logical window size as screen and apply screenScale
-#if defined(_GLFW_WAYLAND) && !defined(_GLFW_X11)
-        if (FLAG_IS_SET(CORE.Window.flags, FLAG_WINDOW_HIGHDPI))
+        // On macOS and Wayland, fullscreen framebuffer pixels can differ from logical mouse coordinates.
+#if defined(__APPLE__) || (defined(_GLFW_WAYLAND) && !defined(_GLFW_X11))
+        bool useLogicalScreenSize = true;
+#if !defined(__APPLE__)
+        useLogicalScreenSize = FLAG_IS_SET(CORE.Window.flags, FLAG_WINDOW_HIGHDPI);
+#endif
+        if (useLogicalScreenSize)
         {
             int winWidth = 0;
             int winHeight = 0;
             glfwGetWindowSize(platform.handle, &winWidth, &winHeight);
 
-            if ((winWidth != width) || (winHeight != height))
+            if ((winWidth > 0) && (winHeight > 0) && ((winWidth != width) || (winHeight != height)))
             {
                 CORE.Window.screen.width = winWidth;
                 CORE.Window.screen.height = winHeight;
