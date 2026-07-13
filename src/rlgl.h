@@ -762,6 +762,14 @@ RLAPI void rlGenTextureMipmaps(unsigned int id, int width, int height, int forma
 RLAPI void *rlReadTexturePixels(unsigned int id, int width, int height, int format); // Read texture pixel data
 RLAPI unsigned char *rlReadScreenPixels(int width, int height);           // Read screen pixel data (color buffer)
 
+// Texture streams (async texture updates through persistently mapped staging buffers)
+// NOTE: Load/Commit/Unload must run on the GL thread, Acquire/Release may run on ONE producer thread
+RLAPI unsigned int rlLoadTextureStream(int width, int height, int format, int bufferCount); // Load texture upload stream, returns stream id (0 if unsupported)
+RLAPI void rlUnloadTextureStream(unsigned int streamId);                  // Unload texture stream and its staging buffers
+RLAPI void *rlAcquireTextureStreamBuffer(unsigned int streamId);          // Acquire a writable staging buffer (NULL if none free)
+RLAPI void rlReleaseTextureStreamBuffer(unsigned int streamId, void *buffer); // Return an acquired staging buffer without uploading
+RLAPI void rlCommitTextureStreamBuffer(unsigned int streamId, unsigned int textureId, void *buffer); // Asynchronously upload an acquired staging buffer to a texture
+
 // Framebuffer management (fbo)
 RLAPI unsigned int rlLoadFramebuffer(void);                               // Load an empty framebuffer
 RLAPI void rlFramebufferAttach(unsigned int id, unsigned int texId, int attachType, int texType, int mipLevel); // Attach texture/renderbuffer to a framebuffer
@@ -3620,6 +3628,241 @@ void rlUpdateTexture(unsigned int id, int offsetX, int offsetY, int width, int h
         glTexSubImage2D(GL_TEXTURE_2D, 0, offsetX, offsetY, width, height, glFormat, glType, data);
     }
     else TRACELOG(RL_LOG_WARNING, "TEXTURE: [ID %i] Failed to update for current texture format (%i)", id, format);
+}
+
+//----------------------------------------------------------------------------------
+// Texture streams: async texture updates through persistently mapped PBOs
+//----------------------------------------------------------------------------------
+#if defined(GRAPHICS_API_OPENGL_33)
+
+#define RL_MAX_TEXTURE_STREAMS          16
+#define RL_TEXTURE_STREAM_MAX_BUFFERS    8
+
+typedef struct rlTextureStreamBuffer {
+    unsigned int pboId;         // Pixel unpack buffer id
+    void *mappedPtr;            // Persistently mapped write pointer
+    GLsync fence;               // Fence guarding pending GPU consumption
+    volatile int state;         // 0 = free, 1 = acquired (CPU writing), 2 = committed (GPU reading)
+} rlTextureStreamBuffer;
+
+typedef struct rlTextureStream {
+    bool active;
+    int width;
+    int height;
+    int format;
+    int dataSize;
+    int bufferCount;
+    rlTextureStreamBuffer buffers[RL_TEXTURE_STREAM_MAX_BUFFERS];
+} rlTextureStream;
+
+static rlTextureStream rlTextureStreams[RL_MAX_TEXTURE_STREAMS] = { 0 };
+
+#endif // GRAPHICS_API_OPENGL_33
+
+// Load a texture upload stream: a ring of persistently mapped pixel-unpack buffers
+// Returns stream id (> 0) on success, 0 when unsupported (requires GL_ARB_buffer_storage) or on failure
+// NOTE: Must be called on the GL thread
+unsigned int rlLoadTextureStream(int width, int height, int format, int bufferCount)
+{
+#if defined(GRAPHICS_API_OPENGL_33)
+    if ((glad_glBufferStorage == NULL) || (glad_glFenceSync == NULL) || (glad_glClientWaitSync == NULL)) return 0;
+    if ((width <= 0) || (height <= 0) || (format >= RL_PIXELFORMAT_COMPRESSED_DXT1_RGB)) return 0;
+    if ((bufferCount < 2) || (bufferCount > RL_TEXTURE_STREAM_MAX_BUFFERS)) return 0;
+
+    int streamIndex = -1;
+    for (int i = 0; i < RL_MAX_TEXTURE_STREAMS; i++)
+    {
+        if (!rlTextureStreams[i].active) { streamIndex = i; break; }
+    }
+
+    if (streamIndex < 0)
+    {
+        TRACELOG(RL_LOG_WARNING, "STREAM: No free texture stream slots available");
+        return 0;
+    }
+
+    rlTextureStream *stream = &rlTextureStreams[streamIndex];
+    memset(stream, 0, sizeof(rlTextureStream));
+    stream->width = width;
+    stream->height = height;
+    stream->format = format;
+    stream->dataSize = rlGetPixelDataSize(width, height, format);
+    stream->bufferCount = bufferCount;
+
+    bool failed = false;
+    for (int i = 0; (i < bufferCount) && !failed; i++)
+    {
+        rlTextureStreamBuffer *buffer = &stream->buffers[i];
+        glGenBuffers(1, &buffer->pboId);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer->pboId);
+        glBufferStorage(GL_PIXEL_UNPACK_BUFFER, stream->dataSize, NULL, GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+        buffer->mappedPtr = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, stream->dataSize, GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+        if (buffer->mappedPtr == NULL) failed = true;
+    }
+
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    if (failed)
+    {
+        for (int i = 0; i < bufferCount; i++)
+        {
+            rlTextureStreamBuffer *buffer = &stream->buffers[i];
+            if (buffer->pboId > 0)
+            {
+                if (buffer->mappedPtr != NULL)
+                {
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer->pboId);
+                    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                }
+                glDeleteBuffers(1, &buffer->pboId);
+            }
+        }
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        memset(stream, 0, sizeof(rlTextureStream));
+        TRACELOG(RL_LOG_WARNING, "STREAM: Failed to map persistent staging buffers");
+        return 0;
+    }
+
+    stream->active = true;
+    TRACELOG(RL_LOG_INFO, "STREAM: [ID %i] Texture stream loaded (%ix%i, %i buffers, %i bytes each)", streamIndex + 1, width, height, bufferCount, stream->dataSize);
+    return (unsigned int)(streamIndex + 1);
+#else
+    (void)width; (void)height; (void)format; (void)bufferCount;
+    return 0;
+#endif
+}
+
+// Unload a texture stream and its staging buffers
+// NOTE: Must be called on the GL thread
+void rlUnloadTextureStream(unsigned int streamId)
+{
+#if defined(GRAPHICS_API_OPENGL_33)
+    if ((streamId == 0) || (streamId > RL_MAX_TEXTURE_STREAMS)) return;
+
+    rlTextureStream *stream = &rlTextureStreams[streamId - 1];
+    if (!stream->active) return;
+
+    for (int i = 0; i < stream->bufferCount; i++)
+    {
+        rlTextureStreamBuffer *buffer = &stream->buffers[i];
+        if (buffer->fence != NULL) glDeleteSync(buffer->fence);
+        if (buffer->pboId > 0)
+        {
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer->pboId);
+            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+            glDeleteBuffers(1, &buffer->pboId);
+        }
+    }
+
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    memset(stream, 0, sizeof(rlTextureStream));
+#else
+    (void)streamId;
+#endif
+}
+
+// Acquire a writable staging buffer from the stream (NULL when none free)
+// NOTE: Safe to call from ONE producer thread while the GL thread commits
+void *rlAcquireTextureStreamBuffer(unsigned int streamId)
+{
+#if defined(GRAPHICS_API_OPENGL_33)
+    if ((streamId == 0) || (streamId > RL_MAX_TEXTURE_STREAMS)) return NULL;
+
+    rlTextureStream *stream = &rlTextureStreams[streamId - 1];
+    if (!stream->active) return NULL;
+
+    for (int i = 0; i < stream->bufferCount; i++)
+    {
+        rlTextureStreamBuffer *buffer = &stream->buffers[i];
+        if (buffer->state == 0)
+        {
+            buffer->state = 1;
+            return buffer->mappedPtr;
+        }
+    }
+#else
+    (void)streamId;
+#endif
+    return NULL;
+}
+
+// Return an acquired staging buffer to the stream without uploading it
+void rlReleaseTextureStreamBuffer(unsigned int streamId, void *buffer)
+{
+#if defined(GRAPHICS_API_OPENGL_33)
+    if ((streamId == 0) || (streamId > RL_MAX_TEXTURE_STREAMS) || (buffer == NULL)) return;
+
+    rlTextureStream *stream = &rlTextureStreams[streamId - 1];
+    if (!stream->active) return;
+
+    for (int i = 0; i < stream->bufferCount; i++)
+    {
+        rlTextureStreamBuffer *streamBuffer = &stream->buffers[i];
+        if ((streamBuffer->mappedPtr == buffer) && (streamBuffer->state == 1))
+        {
+            streamBuffer->state = 0;
+            return;
+        }
+    }
+#else
+    (void)streamId; (void)buffer;
+#endif
+}
+
+// Asynchronously upload an acquired staging buffer to a texture (full-size update)
+// The GPU copy is fenced; the buffer returns to the free pool once the copy completes
+// NOTE: Must be called on the GL thread
+void rlCommitTextureStreamBuffer(unsigned int streamId, unsigned int textureId, void *buffer)
+{
+#if defined(GRAPHICS_API_OPENGL_33)
+    if ((streamId == 0) || (streamId > RL_MAX_TEXTURE_STREAMS)) return;
+
+    rlTextureStream *stream = &rlTextureStreams[streamId - 1];
+    if (!stream->active) return;
+
+    rlTextureStreamBuffer *target = NULL;
+    for (int i = 0; i < stream->bufferCount; i++)
+    {
+        rlTextureStreamBuffer *streamBuffer = &stream->buffers[i];
+
+        // Retire committed buffers whose GPU copy has finished
+        if ((streamBuffer->state == 2) && (streamBuffer->fence != NULL))
+        {
+            GLenum waitResult = glClientWaitSync(streamBuffer->fence, 0, 0);
+            if ((waitResult == GL_ALREADY_SIGNALED) || (waitResult == GL_CONDITION_SATISFIED))
+            {
+                glDeleteSync(streamBuffer->fence);
+                streamBuffer->fence = NULL;
+                streamBuffer->state = 0;
+            }
+        }
+
+        if ((streamBuffer->mappedPtr == buffer) && (streamBuffer->state == 1)) target = streamBuffer;
+    }
+
+    if (target == NULL) return;
+
+    unsigned int glInternalFormat, glFormat, glType;
+    rlGetGlTextureFormats(stream->format, &glInternalFormat, &glFormat, &glType);
+    if (glInternalFormat == 0)
+    {
+        target->state = 0;
+        return;
+    }
+
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, target->pboId);
+    glBindTexture(GL_TEXTURE_2D, textureId);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, stream->width, stream->height, glFormat, glType, NULL);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    target->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (target->fence != NULL) target->state = 2;
+    else target->state = 0;    // Fence creation failed: recycle immediately (upload already issued)
+
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+#else
+    (void)streamId; (void)textureId; (void)buffer;
+#endif
 }
 
 // Get OpenGL internal formats and data type from raylib PixelFormat
